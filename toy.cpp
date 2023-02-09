@@ -6,9 +6,15 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 
 #include <cctype>
 #include <cstdio>
@@ -402,6 +408,7 @@ static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::map<std::string, llvm::Value *> NamedValues;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 
 llvm::Value *LogErrorV(const char *Str) {
   LogError(Str);
@@ -510,6 +517,9 @@ llvm::Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     llvm::verifyFunction(*TheFunction);
 
+    // Optimize the function.
+    TheFPM->run(*TheFunction);
+
     return TheFunction;
   }
 
@@ -522,13 +532,27 @@ llvm::Function *FunctionAST::codegen() {
 // Top-Level parsing
 //===----------------------------------------------------------------------===//
 
-static void InitializeModule() {
+static void InitializeModuleAndPassManager() {
   // Open a new context and module
   TheContext = std::make_unique<llvm::LLVMContext>();
   TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
 
   // create a new builder for the module.
   Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+  // Create a new pass manager attached to it.
+  TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+
+  // Do simple "peehole" optimizations and bit-twiddling optimzations.
+  TheFPM->add(llvm::createInstructionCombiningPass());
+  // Reassociate expressions.
+  TheFPM->add(llvm::createReassociatePass());
+  // Eliminate Common Subexpression.
+  TheFPM->add(llvm::createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->add(llvm::createCFGSimplificationPass());
+
+  TheFPM->doInitialization();
 }
 
 static void HandleDefinition() {
@@ -615,7 +639,7 @@ int main() {
   getNextToken();
 
   // Make the module, which holds all the code.
-  InitializeModule();
+  InitializeModuleAndPassManager();
 
   // Run the main "interpreter loop" now.
   MainLoop();
