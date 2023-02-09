@@ -35,6 +35,11 @@ enum Token {
   // primary
   tok_identifier = -4,
   tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
 };
 
 static std::string IdentifierStr;  // Filled in if tok_identifier
@@ -59,6 +64,12 @@ static int gettok() {
       return tok_def;
     if (IdentifierStr == "extern")
       return tok_extern;
+    if (IdentifierStr == "if")
+      return tok_if;
+    if (IdentifierStr == "then")
+      return tok_then;
+    if (IdentifierStr == "else")
+      return tok_else;
     return tok_identifier;
   }
 
@@ -131,7 +142,7 @@ public:
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
     : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
-  
+
   llvm::Value *codegen() override;
 
 private:
@@ -145,7 +156,7 @@ public:
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
     : Callee(Callee), Args(std::move(Args)) {}
-  
+
   llvm::Value *codegen() override;
 
 private:
@@ -160,7 +171,7 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &Name, std::vector<std::string> Args)
     : Name(Name), Args(std::move(Args)) {}
-  
+
   llvm::Function *codegen();
 
   const std::string &getName() const { return Name; }
@@ -176,7 +187,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
     : Proto(std::move(Proto)), Body(std::move(Body)) {}
-  
+
   llvm::Function *codegen();
 
 private:
@@ -189,6 +200,8 @@ public:
   IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then,
             std::unique_ptr<ExprAST> Else)
     : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  llvm::Value *codegen() override;
 
 private:
   std::unique_ptr<ExprAST> Cond, Then, Else;
@@ -286,6 +299,35 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+/// ifexpr ::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken();   // eat if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+  
+  if (CurTok != tok_then)
+    return LogError("expected then");
+  getNextToken();   // eat then.
+
+  // then.
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+  
+  if (CurTok != tok_else)
+    return LogError("expected else");
+  getNextToken();   // eat else.
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+  
+  return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
+}
+
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -298,6 +340,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
   default:
     return LogError("unknown token when expecting an expression");
   }
@@ -526,6 +570,58 @@ llvm::Function *FunctionAST::codegen() {
   // Error reading body, remove function
   TheFunction->removeFromParent();
   return nullptr;
+}
+
+llvm::Value *IfExprAST::codegen() {
+  llvm::Value *CondV = Cond->codegen();
+  if (!CondV)
+    return nullptr;
+  
+  // Convert condition to a bool by comparing non-equal to 0.0
+  CondV = Builder->CreateFCmpONE(
+      CondV, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "ifcond");
+  
+  llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+  // Create blocks for the then and else cases.  Insert the 'then' block at the
+  // end of the function
+  llvm::BasicBlock *ThenBB = 
+        llvm::BasicBlock::Create(*TheContext, "then", TheFunction);
+  llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(*TheContext, "else");
+  llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(*TheContext, "ifcont");
+
+  Builder->CreateCondBr(CondV, ThenBB, ElseBB);   // 插入条件跳转的分支
+
+  // Emit then value.
+  Builder->SetInsertPoint(ThenBB);
+
+  llvm::Value *ThenV = Then->codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder->CreateBr(MergeBB);   // 在ThenBB中创建一个跳转到MergeBB的分支
+  // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder->GetInsertBlock();
+
+  // Emit else block
+  TheFunction->insert(TheFunction->end(), ElseBB);    // 插入ElseBB块
+  Builder->SetInsertPoint(ElseBB);                    // 后续的指令都插入到ElseBB
+
+  llvm::Value *ElseV = Else->codegen();               // Else产生的代码都进入ElseBB块
+  if (!ElseV)
+    return nullptr;
+  
+  Builder->CreateBr(MergeBB);
+  ElseBB = Builder->GetInsertBlock();
+
+  // Emit merge block
+  TheFunction->insert(TheFunction->end(), MergeBB);
+  Builder->SetInsertPoint(MergeBB);
+  llvm::PHINode *PN = Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
 }
 
 //===----------------------------------------------------------------------===//
