@@ -1,1 +1,1 @@
-g++ -g -O3 toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs all` -o toy
+g++ -g -O3 scanner.cpp parser.cpp codegen.cpp toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs all` -o toy
